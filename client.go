@@ -406,7 +406,11 @@ func (cl *Client) Close() {
 	cl.lock()
 	defer cl.unlock()
 	cl.closed.Set()
-	// cl.eachDhtServer(func(s DhtServer) { s.Close() }) // TODO
+	cl.eachDhtServer(func(s DhtServer) {
+		if c, ok := s.(interface{ Close() }); ok {
+			c.Close()
+		}
+	})
 	cl.closeSockets()
 	for _, t := range cl.torrents {
 		t.close()
