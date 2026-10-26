@@ -104,7 +104,8 @@ func parseInfohash(xt string) (ih Hash, err error) {
 		return
 	}
 	if n != 20 {
-		panic(n)
+		err = fmt.Errorf("decoded infohash has bad length: %d", n)
+		return
 	}
 	return
 }
