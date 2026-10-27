@@ -181,7 +181,7 @@ func (cn *connection) cumInterest() time.Duration {
 
 func (cn *connection) peerHasAllPieces() (all bool, known bool) {
 	if cn.peerSentHaveAll {
-		return true, true
+		return cn.peerDontHave.Len() == 0, true
 	}
 	if !cn.t.haveInfo() {
 		return false, false
@@ -757,6 +757,8 @@ func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) boo
 		// Pieces to skip include pieces the peer doesn't have.
 		skip = bitmap.Flip(cn.peerPieces, 0, bitmap.BitIndex(cn.t.numPieces()))
 	}
+	// lt_donthave overrides HaveAll. Leaving those pieces in the order panics in request.
+	skip.Union(cn.peerDontHave)
 	// And pieces that we already have.
 	skip.Union(cn.t.completedPieces)
 	skip.Union(cn.t.piecesQueuedForHash)
@@ -971,7 +973,11 @@ func (cn *connection) peerSentHave(piece pieceIndex) error {
 	if cn.t.haveInfo() && piece >= cn.t.numPieces() || piece < 0 {
 		return errors.New("invalid piece")
 	}
+	cn.peerDontHave.Remove(bitmap.BitIndex(piece))
 	if cn.PeerHasPiece(piece) {
+		if cn.t.haveInfo() && cn.updatePiecePriority(piece) {
+			cn.updateRequests()
+		}
 		return nil
 	}
 	cn.raisePeerMinPieces(piece + 1)
@@ -984,6 +990,7 @@ func (cn *connection) peerSentHave(piece pieceIndex) error {
 
 func (cn *connection) peerSentBitfield(bf []bool) error {
 	cn.peerSentHaveAll = false
+	cn.peerDontHave.Clear()
 	if len(bf)%8 != 0 {
 		panic("expected bitfield length divisible by 8")
 	}
@@ -1007,6 +1014,7 @@ func (cn *connection) peerSentBitfield(bf []bool) error {
 func (cn *connection) onPeerSentHaveAll() error {
 	cn.peerSentHaveAll = true
 	cn.peerPieces.Clear()
+	cn.peerDontHave.Clear()
 	cn.peerPiecesChanged()
 	return nil
 }
@@ -1014,6 +1022,7 @@ func (cn *connection) onPeerSentHaveAll() error {
 func (cn *connection) peerSentHaveNone() error {
 	cn.peerPieces.Clear()
 	cn.peerSentHaveAll = false
+	cn.peerDontHave.Clear()
 	cn.peerPiecesChanged()
 	return nil
 }

@@ -19,9 +19,16 @@ func (c *connection) onDontHave(payload []byte) error {
 	if len(payload) < 4 {
 		return nil
 	}
-	idx := int(binary.BigEndian.Uint32(payload))
-	c.peerDontHave.Add(idx)
-	c.peerPieces.Remove(idx)
+	idx := pieceIndex(binary.BigEndian.Uint32(payload))
+	if c.t != nil && c.t.haveInfo() && idx >= c.t.numPieces() {
+		return nil
+	}
+	c.peerDontHave.Add(bitmap.BitIndex(idx))
+	c.peerPieces.Remove(bitmap.BitIndex(idx))
+	if c.t != nil && c.t.haveInfo() && c.updatePiecePriority(idx) {
+		c.updateRequests()
+		return nil
+	}
 	c.updateRequests()
 	return nil
 }

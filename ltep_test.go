@@ -51,6 +51,49 @@ func TestSuggestIgnoredOutsideReader(t *testing.T) {
 	}
 }
 
+func TestDontHaveNotRequestedAfterHaveAll(t *testing.T) {
+	cn := chokeFixture(2)
+	defer stopChokeFixture(cn)
+	var mu sync.Mutex
+	cn.writerCond.L = &mu
+	for i := 0; i < 2; i++ {
+		cn.t.pendingPieces.Set(i, PiecePriorityNormal.BitmapPriority())
+	}
+	cn.PeerChoked = false
+	if err := cn.onDontHave([]byte{0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	cn.fillWriteBuffer(func(msg pp.Message) bool {
+		if msg.Type == pp.Request && msg.Index == 0 {
+			t.Fatal("requested a piece the peer does not have")
+		}
+		return true
+	})
+	if len(cn.requests) == 0 {
+		t.Fatal("stopped requesting pieces the peer still has")
+	}
+}
+
+func TestHaveClearsDontHave(t *testing.T) {
+	cn := chokeFixture(1)
+	defer stopChokeFixture(cn)
+	var mu sync.Mutex
+	cn.writerCond.L = &mu
+	cn.t.pendingPieces.Set(0, PiecePriorityNormal.BitmapPriority())
+	if err := cn.onDontHave([]byte{0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if cn.PeerHasPiece(0) {
+		t.Fatal("dont-have ignored")
+	}
+	if err := cn.peerSentHave(0); err != nil {
+		t.Fatal(err)
+	}
+	if !cn.PeerHasPiece(0) {
+		t.Fatal("have did not restore the piece")
+	}
+}
+
 func TestSentDontHavePostsExtended(t *testing.T) {
 	var mu sync.Mutex
 	cn := &connection{
