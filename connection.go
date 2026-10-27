@@ -22,6 +22,7 @@ import (
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/mse"
 	pp "github.com/anacrolix/torrent/peer_protocol"
+	"github.com/anacrolix/torrent/peer_protocol/utholepunch"
 	"github.com/pkg/errors"
 )
 
@@ -34,6 +35,7 @@ const (
 	peerSourceDHTAnnouncePeer = "Ha" // Peers that were announced to us by a DHT.
 	peerSourcePEX             = "X"
 	peerSourceLPD             = "L" // Peer discovered through local peer discovery
+	peerSourceHolepunch       = "H" // Peer introduced by BEP 55 ut_holepunch
 )
 
 // Maintains the state of a connection with a peer.
@@ -108,6 +110,15 @@ type connection struct {
 	PeerMaxRequests  int // Maximum pending requests the peer allows.
 	PeerExtensionIDs map[pp.ExtensionName]pp.ExtensionNumber
 	PeerClientName   string
+	// Listen port from the extended handshake. Used by BEP 55 to dial the peer again.
+	PeerListenPort int
+	// uploadOnly is the libtorrent upload_only LTEP flag (a seed that will not download).
+	uploadOnly bool
+	// peerDontHave overrides HaveAll / the bitfield for lt_donthave.
+	peerDontHave bitmap.Bitmap
+	// suggestPiece is a BEP 6 Suggest that landed inside a reader window.
+	suggestOK    bool
+	suggestPiece pieceIndex
 
 	pieceInclination  []int
 	pieceRequestOrder prioritybitmap.PriorityBitmap
@@ -324,6 +335,9 @@ func (cn *connection) Close() {
 }
 
 func (cn *connection) PeerHasPiece(piece pieceIndex) bool {
+	if cn.peerDontHave.Get(bitmap.BitIndex(piece)) {
+		return false
+	}
 	return cn.peerSentHaveAll || cn.peerPieces.Contains(bitmap.BitIndex(piece))
 }
 
@@ -793,9 +807,24 @@ func (cn *connection) shouldRequestWithoutBias() bool {
 	return false
 }
 
+func (cn *connection) noteSuggest(idx pieceIndex) {
+	// A Suggest outside the reader window must not change what we request.
+	if !cn.t.pieceInReaderZone(pieceRange{idx, idx + 1}) {
+		return
+	}
+	cn.suggestPiece = idx
+	cn.suggestOK = true
+	cn.updateRequests()
+}
+
 func (cn *connection) iterPendingPieces(f func(pieceIndex) bool) bool {
 	if !cn.t.haveInfo() {
 		return false
+	}
+	if cn.suggestOK && cn.PeerHasPiece(cn.suggestPiece) && cn.t.pieceInReaderZone(pieceRange{cn.suggestPiece, cn.suggestPiece + 1}) {
+		if !f(cn.suggestPiece) {
+			return false
+		}
 	}
 	if cn.t.requestStrategy == 3 {
 		return cn.iterUnbiasedPieceRequestOrder(f)
@@ -1229,8 +1258,7 @@ func (c *connection) mainReadLoop() (err error) {
 			c.updateRequests()
 		case pp.Suggest:
 			torrent.Add("suggests received", 1)
-			// log.Fmsg("peer suggested piece %d", msg.Index).AddValues(c, msg.Index, debugLogValue).Log(c.t.logger)
-			c.updateRequests()
+			c.noteSuggest(pieceIndex(msg.Index))
 		default:
 			err = fmt.Errorf("received unknown message type: %#v", msg.Type)
 		}
@@ -1278,9 +1306,13 @@ func (c *connection) onReadExtendedMsg(id pp.ExtensionNumber, payload []byte) (e
 				return errors.Wrapf(err, "setting metadata size to %d", d.MetadataSize)
 			}
 		}
+		if d.Port > 0 {
+			c.PeerListenPort = d.Port
+		}
 		if _, ok := c.PeerExtensionIDs[pp.ExtensionNameMetadata]; ok {
 			c.requestPendingMetadata()
 		}
+		c.maybeSendUploadOnly()
 		return nil
 	case metadataExtendedId:
 		err := cl.gotMetadataExtensionMsg(payload, t, c)
@@ -1288,6 +1320,16 @@ func (c *connection) onReadExtendedMsg(id pp.ExtensionNumber, payload []byte) (e
 			return fmt.Errorf("error handling metadata extension message: %s", err)
 		}
 		return nil
+	case holepunchExtendedId:
+		var msg utholepunch.Msg
+		if err := msg.UnmarshalBinary(payload); err != nil {
+			return fmt.Errorf("ut_holepunch: %w", err)
+		}
+		return t.handleUtHolepunch(msg, c)
+	case uploadOnlyExtendedId:
+		return c.onUploadOnly(payload)
+	case dontHaveExtendedId:
+		return c.onDontHave(payload)
 	case pexExtendedId:
 		if cl.config.DisablePEX {
 			// TODO: Maybe close the connection. Check that we're not
@@ -1445,6 +1487,10 @@ func (c *connection) onDirtiedPiece(piece pieceIndex) {
 
 func (c *connection) uploadAllowed() bool {
 	if c.t.cl.config.NoUpload {
+		return false
+	}
+	// A peer that will not download is not a reciprocity target.
+	if c.uploadOnly && !c.PeerInterested {
 		return false
 	}
 	if c.t.seeding() {

@@ -18,6 +18,8 @@ type TorrentSpec struct {
 	// set.
 	ChunkSize int
 	Storage   storage.ClientImpl
+	// WebSeeds are BEP 19 url-list / magnet ws URLs.
+	WebSeeds []string
 }
 
 func TorrentSpecFromMagnetURI(uri string) (spec *TorrentSpec, err error) {
@@ -29,6 +31,7 @@ func TorrentSpecFromMagnetURI(uri string) (spec *TorrentSpec, err error) {
 		Trackers:    [][]string{m.Trackers},
 		DisplayName: m.DisplayName,
 		InfoHash:    m.InfoHash,
+		WebSeeds:    append([]string(nil), m.Params["ws"]...),
 	}
 	return
 }
@@ -40,6 +43,7 @@ func TorrentSpecFromMetaInfo(mi *metainfo.MetaInfo) (spec *TorrentSpec) {
 		InfoBytes:   mi.InfoBytes,
 		DisplayName: info.Name,
 		InfoHash:    mi.HashInfoBytes(),
+		WebSeeds:    append([]string(nil), mi.UrlList...),
 	}
 	if spec.Trackers == nil && mi.Announce != "" {
 		spec.Trackers = [][]string{{mi.Announce}}

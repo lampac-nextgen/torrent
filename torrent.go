@@ -78,6 +78,11 @@ type Torrent struct {
 	// TODO: Only announce stuff is used?
 	metainfo metainfo.MetaInfo
 
+	webseedURLs    []string
+	webseedKnown   map[string]struct{}
+	webseedStarted map[string]struct{}
+	webseedBusy    map[pieceIndex]struct{}
+
 	// The info dict. nil if we don't have it (yet).
 	info  *metainfo.Info
 	files *[]*File
@@ -386,6 +391,7 @@ func (t *Torrent) onSetInfo() {
 	t.updateWantPeersEvent()
 	t.pendingRequests = make(map[request]int)
 	t.lastRequested = make(map[request]*time.Timer)
+	t.startWebseeds()
 }
 
 // Called when metadata for a torrent becomes available.
@@ -1735,6 +1741,9 @@ func (t *Torrent) onPieceCompleted(piece pieceIndex) {
 
 // Called when a piece is found to be not complete.
 func (t *Torrent) onIncompletePiece(piece pieceIndex) {
+	for c := range t.conns {
+		c.sentDontHave(piece)
+	}
 	if t.pieceAllDirty(piece) {
 		t.pendAllChunkSpecs(piece)
 	}

@@ -26,6 +26,12 @@ type (
 const (
 	// http://www.bittorrent.org/beps/bep_0011.html
 	ExtensionNamePex ExtensionName = "ut_pex"
+	// BEP 55. Relays a UDP dial when a direct connection fails.
+	ExtensionNameHolepunch ExtensionName = "ut_holepunch"
+	// Libtorrent: the peer will not download.
+	ExtensionNameUploadOnly ExtensionName = "upload_only"
+	// Libtorrent: the peer no longer has this piece.
+	ExtensionNameDontHave ExtensionName = "lt_donthave"
 	// http://bittorrent.org/beps/bep_0009.html. Note that there's an
 	// LT_metadata, but I've never implemented it.
 	ExtensionNameMetadata = "ut_metadata"

@@ -39,6 +39,8 @@ type ClientConfig struct {
 	// Don't announce to trackers. This only leaves DHT to discover peers.
 	DisableTrackers bool `long:"disable-trackers"`
 	DisablePEX      bool `long:"disable-pex"`
+	// DisableWebseeds turns off BEP 19 HTTP seeding (url-list and magnet ws).
+	DisableWebseeds bool `long:"disable-webseeds"`
 
 	// Don't create a DHT.
 	NoDHT            bool `long:"disable-dht"`

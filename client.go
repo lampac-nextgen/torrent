@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	gosync "sync"
 	"time"
 
 	"github.com/anacrolix/dht/v2"
@@ -75,6 +76,9 @@ type Client struct {
 	numHalfOpen     int
 	upnpMappings    []*upnpMapping
 	lpd             *lpdServer
+
+	webseedOnce   gosync.Once
+	webseedClient *http.Client
 }
 
 type ipStr string
@@ -574,6 +578,12 @@ func (cl *Client) dopplegangerAddr(addr string) bool {
 
 // Returns a connection over UTP or TCP, whichever is first to connect.
 func (cl *Client) dialFirst(ctx context.Context, addr string) dialResult {
+	return cl.dialFirstFiltered(ctx, addr, nil)
+}
+
+// dialFirstFiltered is dialFirst restricted to sockets whose network allow returns true.
+// A nil allow accepts every enabled network.
+func (cl *Client) dialFirstFiltered(ctx context.Context, addr string, allow func(network string) bool) dialResult {
 	ctx, cancel := context.WithCancel(ctx)
 	// As soon as we return one connection, cancel the others.
 	defer cancel()
@@ -584,6 +594,9 @@ func (cl *Client) dialFirst(ctx context.Context, addr string) dialResult {
 		defer cl.unlock()
 		cl.eachListener(func(s socket) bool {
 			network := s.Addr().Network()
+			if allow != nil && !allow(network) {
+				return true
+			}
 			if peerNetworkEnabled(parseNetworkString(network), cl.config) {
 				left++
 				go func() {
@@ -693,10 +706,23 @@ func (cl *Client) handshakesConnection(ctx context.Context, nc net.Conn, t *Torr
 
 // Returns nil connection and nil error if no connection could be established
 // for valid reasons.
-func (cl *Client) establishOutgoingConnEx(t *Torrent, addr IpPort, ctx context.Context, obfuscatedHeader bool) (c *connection, err error) {
-	dr := cl.dialFirst(ctx, addr.String())
+func (cl *Client) establishOutgoingConnEx(t *Torrent, addr IpPort, ctx context.Context, obfuscatedHeader, rendezvous, preferUTP bool) (c *connection, err error) {
+	var dr dialResult
+	if preferUTP {
+		dr = cl.dialFirstFiltered(ctx, addr.String(), func(network string) bool {
+			return strings.Contains(network, "udp")
+		})
+	}
+	if dr.Conn == nil {
+		dr = cl.dialFirst(ctx, addr.String())
+	}
 	nc := dr.Conn
 	if nc == nil {
+		if rendezvous {
+			cl.lock()
+			t.trySendHolepunchRendezvous(addr)
+			cl.unlock()
+		}
 		return
 	}
 	defer func() {
@@ -709,7 +735,7 @@ func (cl *Client) establishOutgoingConnEx(t *Torrent, addr IpPort, ctx context.C
 
 // Returns nil connection and nil error if no connection could be established
 // for valid reasons.
-func (cl *Client) establishOutgoingConn(t *Torrent, addr IpPort) (c *connection, err error) {
+func (cl *Client) establishOutgoingConn(t *Torrent, addr IpPort, rendezvous, preferUTP bool) (c *connection, err error) {
 	torrent.Add("establish outgoing connection", 1)
 	ctx, cancel := context.WithTimeout(context.Background(), func() time.Duration {
 		cl.rLock()
@@ -718,7 +744,7 @@ func (cl *Client) establishOutgoingConn(t *Torrent, addr IpPort) (c *connection,
 	}())
 	defer cancel()
 	obfuscatedHeaderFirst := !cl.config.DisableEncryption && !cl.config.PreferNoEncryption
-	c, err = cl.establishOutgoingConnEx(t, addr, ctx, obfuscatedHeaderFirst)
+	c, err = cl.establishOutgoingConnEx(t, addr, ctx, obfuscatedHeaderFirst, rendezvous, preferUTP)
 	if err != nil {
 		return
 	}
@@ -735,7 +761,7 @@ func (cl *Client) establishOutgoingConn(t *Torrent, addr IpPort) (c *connection,
 		return
 	}
 	// Try again with encryption if we didn't earlier, or without if we did.
-	c, err = cl.establishOutgoingConnEx(t, addr, ctx, !obfuscatedHeaderFirst)
+	c, err = cl.establishOutgoingConnEx(t, addr, ctx, !obfuscatedHeaderFirst, false, preferUTP)
 	if c != nil {
 		torrent.Add("initiated conn with fallback header obfuscation", 1)
 	}
@@ -746,7 +772,8 @@ func (cl *Client) establishOutgoingConn(t *Torrent, addr IpPort) (c *connection,
 // considered half-open.
 func (cl *Client) outgoingConnection(t *Torrent, addr IpPort, ps peerSource) {
 	cl.dialRateLimiter.Wait(context.Background())
-	c, err := cl.establishOutgoingConn(t, addr)
+	// A holepunch dial must not ask for another rendezvous, and prefers uTP (BEP 55).
+	c, err := cl.establishOutgoingConn(t, addr, ps != peerSourceHolepunch, ps == peerSourceHolepunch && !cl.config.DisableUTP)
 	cl.lock()
 	defer cl.unlock()
 	// Don't release lock between here and addConnection, unless it's for
@@ -953,7 +980,10 @@ func (cl *Client) sendInitialMessages(conn *connection, torrent *Torrent) {
 			ExtendedPayload: func() []byte {
 				msg := pp.ExtendedHandshakeMessage{
 					M: map[pp.ExtensionName]pp.ExtensionNumber{
-						pp.ExtensionNameMetadata: metadataExtendedId,
+						pp.ExtensionNameMetadata:   metadataExtendedId,
+						pp.ExtensionNameHolepunch:  holepunchExtendedId,
+						pp.ExtensionNameUploadOnly: uploadOnlyExtendedId,
+						pp.ExtensionNameDontHave:   dontHaveExtendedId,
 					},
 					V:            cl.config.ExtendedHandshakeClientVersion,
 					Reqq:         64, // TODO: Really?
@@ -978,14 +1008,17 @@ func (cl *Client) sendInitialMessages(conn *connection, torrent *Torrent) {
 			if torrent.haveAllPieces() {
 				conn.Post(pp.Message{Type: pp.HaveAll})
 				conn.sentHaves.AddRange(0, bitmap.BitIndex(conn.t.NumPieces()))
+				conn.sendAllowedFast()
 				return
 			} else if !torrent.haveAnyPieces() {
 				conn.Post(pp.Message{Type: pp.HaveNone})
 				conn.sentHaves.Clear()
+				conn.sendAllowedFast()
 				return
 			}
 		}
 		conn.PostBitfield()
+		conn.sendAllowedFast()
 	}()
 	if conn.PeerExtensionBytes.SupportsDHT() && cl.extensionBytes.SupportsDHT() && cl.haveDhtServer() {
 		conn.Post(pp.Message{
@@ -1186,6 +1219,7 @@ func (cl *Client) AddTorrentSpec(spec *TorrentSpec) (t *Torrent, new bool, err e
 		t.setChunkSize(pp.Integer(spec.ChunkSize))
 	}
 	t.addTrackers(spec.Trackers)
+	t.addWebseedURLs(spec.WebSeeds)
 	t.maybeNewConns()
 	return
 }
