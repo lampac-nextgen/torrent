@@ -249,6 +249,24 @@ func (p *Piece) UpdateCompletion() {
 	p.t.updatePieceCompletion(p.index)
 }
 
+// Forget tells the Client that storage dropped this piece's bytes. Chunks written since the last
+// hash are requested again. Without it an evicted partial piece is finished over zeroed storage,
+// fails its hash, and the Client drops a peer that sent good data. A piece queued for or under a
+// hash is left alone: its bytes must still be there.
+func (p *Piece) Forget() {
+	p.t.cl.lock()
+	defer p.t.cl.unlock()
+	if p.hashing || p.t.pieceQueuedForHash(p.index) {
+		return
+	}
+	p.t.pendAllChunkSpecs(p.index)
+	p.t.reapPieceTouchers(p.index)
+	p.t.updatePieceCompletion(p.index)
+	for c := range p.t.conns {
+		c.updateRequests()
+	}
+}
+
 func (p *Piece) completion() (ret storage.Completion) {
 	ret.Complete = p.t.pieceComplete(p.index)
 	ret.Ok = p.storageCompletionOk
