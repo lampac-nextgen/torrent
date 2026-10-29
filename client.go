@@ -394,7 +394,13 @@ func (cl *Client) eachDhtServer(f func(DhtServer)) {
 
 func (cl *Client) closeSockets() {
 	cl.eachListener(func(l socket) bool {
-		l.Close()
+		// utp Socket.Close keeps the UDP port until its peer conns are gone, so a
+		// client restarted on the same ListenPort fails with "address already in use".
+		if cn, ok := l.(interface{ CloseNow() error }); ok {
+			cn.CloseNow()
+		} else {
+			l.Close()
+		}
 		return true
 	})
 	cl.conns = nil

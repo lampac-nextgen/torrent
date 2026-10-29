@@ -155,6 +155,14 @@ type utpSocketSocket struct {
 	d       proxy.Dialer
 }
 
+// CloseNow releases the UDP port immediately; see Client.closeSockets.
+func (me utpSocketSocket) CloseNow() error {
+	if cn, ok := me.utpSocket.(interface{ CloseNow() error }); ok {
+		return cn.CloseNow()
+	}
+	return me.utpSocket.Close()
+}
+
 func (me utpSocketSocket) dial(ctx context.Context, addr string) (conn net.Conn, err error) {
 	defer perf.ScopeTimerErr(&err)()
 	if me.d != nil {
