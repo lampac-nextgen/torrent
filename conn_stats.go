@@ -67,7 +67,7 @@ func (me *Count) String() string {
 }
 
 func (me *Count) MarshalJSON() ([]byte, error) {
-	return json.Marshal(me.n)
+	return json.Marshal(me.Int64())
 }
 
 func (cs *ConnStats) wroteMsg(msg *pp.Message) {
