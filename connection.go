@@ -720,54 +720,37 @@ func (cn *connection) updateRequests() {
 	cn.tickleWriter()
 }
 
-// Emits the indices in the Bitmaps bms in order, never repeating any index.
-// skip is mutated during execution, and its initial values will never be
-// emitted.
-func iterBitmapsDistinct(skip *bitmap.Bitmap, bms ...bitmap.Bitmap) iter.Func {
-	return func(cb iter.Callback) {
-		for _, bm := range bms {
-			if !iter.All(func(i interface{}) bool {
-				skip.Add(i.(int))
-				return cb(i)
-			}, bitmap.Sub(bm, *skip).Iter) {
-				return
-			}
-		}
-	}
-}
-
 func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) bool) bool {
 	now, next, readahead, zone := cn.t.readerPiecePriorities()
-	var skip bitmap.Bitmap
-	if !cn.peerSentHaveAll {
-		// Pieces to skip include pieces the peer doesn't have.
-		skip = bitmap.Flip(cn.peerPieces, 0, bitmap.BitIndex(cn.t.numPieces()))
+	return cn.iterPieceOrder(f, now, next, readahead, zone)
+}
+
+// iterPieceOrder emits the reader priority classes in order, then the other pending pieces, each
+// piece once, skipping pieces the peer lacks, pieces we have and pieces queued for a hash. It runs
+// on every writer pass of every connection, so it tests those sets per piece: building a skip set
+// with Flip(peerPieces) and a Sub per class allocated several bitmap containers per pass, about
+// half of all allocations while streaming a large torrent.
+func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, classes ...bitmap.Bitmap) bool {
+	var seen bitmap.Bitmap
+	yield := func(i int) bool {
+		if seen.Contains(i) ||
+			!cn.peerSentHaveAll && !cn.peerPieces.Contains(i) ||
+			cn.t.completedPieces.Contains(i) ||
+			cn.t.piecesQueuedForHash.Contains(i) {
+			return true
+		}
+		seen.Add(i)
+		if cn.t.hashingPiece(i) {
+			return true
+		}
+		return f(i)
 	}
-	// And pieces that we already have.
-	skip.Union(cn.t.completedPieces)
-	skip.Union(cn.t.piecesQueuedForHash)
-	// Return an iterator over the different priority classes, minus the skip
-	// pieces.
-	return iter.All(
-		func(_piece interface{}) bool {
-			i := _piece.(bitmap.BitIndex)
-			if cn.t.hashingPiece(pieceIndex(i)) {
-				return true
-			}
-			return f(pieceIndex(i))
-		},
-		iterBitmapsDistinct(&skip, now, next, readahead, zone),
-		func(cb iter.Callback) {
-			cn.t.pendingPieces.IterTyped(func(piece int) bool {
-				if skip.Contains(piece) {
-					return true
-				}
-				more := cb(piece)
-				skip.Add(piece)
-				return more
-			})
-		},
-	)
+	for _, bm := range classes {
+		if !bm.IterTyped(yield) {
+			return false
+		}
+	}
+	return cn.t.pendingPieces.IterTyped(yield)
 }
 
 // The connection should download highest priority pieces first, without any
