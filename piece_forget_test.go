@@ -82,3 +82,39 @@ func TestPieceForgetSkipsHashing(t *testing.T) {
 		t.Fatal("dirty chunk of a piece under hash was requested again")
 	}
 }
+
+// TestPieceEvictReleasesAndForgets checks that Evict drops the bytes and the dirty chunks together.
+func TestPieceEvictReleasesAndForgets(t *testing.T) {
+	cn := forgetFixture(t)
+	p := &cn.t.pieces[0]
+	released := false
+	if !p.Evict(func() { released = true }) || !released {
+		t.Fatal("Evict did not release an idle partial piece")
+	}
+	if n := p.dirtyChunks.Len(); n != 0 {
+		t.Fatalf("%d chunks still dirty after Evict", n)
+	}
+	if !requestedChunk0(cn) {
+		t.Fatal("evicted chunk was not requested again")
+	}
+}
+
+// TestPieceEvictSkipsBusyPiece checks that Evict keeps a piece with a write in flight or under a hash.
+func TestPieceEvictSkipsBusyPiece(t *testing.T) {
+	for name, busy := range map[string]func(*Piece){
+		"pending write": func(p *Piece) { p.incrementPendingWrites() },
+		"hashing":       func(p *Piece) { p.hashing = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cn := forgetFixture(t)
+			p := &cn.t.pieces[0]
+			busy(p)
+			if p.Evict(func() { t.Fatal("release called on a busy piece") }) {
+				t.Fatal("Evict reported success on a busy piece")
+			}
+			if n := p.dirtyChunks.Len(); n != 2 {
+				t.Fatalf("Evict cleared %d dirty chunks of a busy piece", 2-n)
+			}
+		})
+	}
+}

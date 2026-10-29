@@ -259,12 +259,37 @@ func (p *Piece) Forget() {
 	if p.hashing || p.t.pieceQueuedForHash(p.index) {
 		return
 	}
+	p.forgetLocked()
+}
+
+// Evict calls release to drop a partial piece's bytes and forgets its chunks in the same critical
+// section, so no chunk can land in between and be hashed over the released storage. It returns
+// false without calling release while a chunk write is in flight or the piece is queued for or
+// under a hash. release runs under the client lock and must not call back into the Client.
+func (p *Piece) Evict(release func()) bool {
+	p.t.cl.lock()
+	defer p.t.cl.unlock()
+	if p.hashing || p.t.pieceQueuedForHash(p.index) || p.hasPendingWrites() {
+		return false
+	}
+	release()
+	p.forgetLocked()
+	return true
+}
+
+func (p *Piece) forgetLocked() {
 	p.t.pendAllChunkSpecs(p.index)
 	p.t.reapPieceTouchers(p.index)
 	p.t.updatePieceCompletion(p.index)
 	for c := range p.t.conns {
 		c.updateRequests()
 	}
+}
+
+func (p *Piece) hasPendingWrites() bool {
+	p.pendingWritesMutex.Lock()
+	defer p.pendingWritesMutex.Unlock()
+	return p.pendingWrites != 0
 }
 
 func (p *Piece) completion() (ret storage.Completion) {
