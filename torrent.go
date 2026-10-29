@@ -1260,6 +1260,11 @@ func (t *Torrent) bytesCompleted() int64 {
 func (t *Torrent) SetInfoBytes(b []byte) (err error) {
 	t.cl.lock()
 	defer t.cl.unlock()
+	if t.haveInfo() {
+		// Re-adding a live torrent must not rebuild pieces and files that
+		// readers and Length() use without the client lock.
+		return nil
+	}
 	return t.setInfoBytes(b)
 }
 
