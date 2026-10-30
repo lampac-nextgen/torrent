@@ -727,19 +727,18 @@ func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) boo
 
 // iterPieceOrder emits the reader priority classes in order, then the other pending pieces, each
 // piece once, skipping pieces the peer lacks, pieces we have and pieces queued for a hash. It runs
-// on every writer pass of every connection, so it tests those sets per piece: building a skip set
-// with Flip(peerPieces) and a Sub per class allocated several bitmap containers per pass, about
-// half of all allocations while streaming a large torrent.
+// on every writer pass of every connection. Building that skip set with Flip(peerPieces) and a Sub
+// per class allocated several roaring containers per pass, about half of all allocations while
+// streaming a large torrent; per-piece Contains on sparse sets avoided that but made a full scan
+// slower. The set now lives in a reused dense buffer: no allocation, and an O(1) test per piece.
 func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, classes ...bitmap.Bitmap) bool {
-	var seen bitmap.Bitmap
+	skip := cn.buildPieceOrderSkip()
 	yield := func(i int) bool {
-		if seen.Contains(i) ||
-			!cn.peerSentHaveAll && !cn.peerPieces.Contains(i) ||
-			cn.t.completedPieces.Contains(i) ||
-			cn.t.piecesQueuedForHash.Contains(i) {
+		w, b := i>>6, uint64(1)<<(uint(i)&63)
+		if w >= len(skip) || skip[w]&b != 0 {
 			return true
 		}
-		seen.Add(i)
+		skip[w] |= b
 		if cn.t.hashingPiece(i) {
 			return true
 		}
@@ -751,6 +750,52 @@ func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, classes ...bitmap.
 		}
 	}
 	return cn.t.pendingPieces.IterTyped(yield)
+}
+
+// buildPieceOrderSkip fills t.pieceOrderSkip with the pieces this peer lacks, the pieces we have
+// and the pieces queued for a hash.
+func (cn *connection) buildPieceOrderSkip() []uint64 {
+	t := cn.t
+	n := (t.numPieces() + 63) / 64
+	for _, bm := range [...]*bitmap.Bitmap{&cn.peerPieces, &t.completedPieces, &t.piecesQueuedForHash} {
+		if bm.RB != nil {
+			if d := int(bm.RB.DenseSize()); d > n {
+				n = d
+			}
+		}
+	}
+	skip := growWords(&t.pieceOrderSkip, n)
+	if !cn.peerSentHaveAll {
+		if cn.peerPieces.RB != nil {
+			cn.peerPieces.RB.WriteDenseTo(skip)
+		}
+		for i := range skip {
+			skip[i] = ^skip[i]
+		}
+	}
+	// WriteDenseTo copies over bitmap containers instead of OR-ing them, so each set goes
+	// through the scratch buffer.
+	for _, bm := range [...]*bitmap.Bitmap{&t.completedPieces, &t.piecesQueuedForHash} {
+		if bm.RB == nil || bm.RB.IsEmpty() {
+			continue
+		}
+		scratch := growWords(&t.pieceOrderScratch, n)
+		bm.RB.WriteDenseTo(scratch)
+		for i, w := range scratch {
+			skip[i] |= w
+		}
+	}
+	return skip
+}
+
+// growWords returns (*buf)[:n] cleared, reallocating only when the buffer is too short.
+func growWords(buf *[]uint64, n int) []uint64 {
+	if cap(*buf) < n {
+		*buf = make([]uint64, n)
+	}
+	s := (*buf)[:n]
+	clear(s)
+	return s
 }
 
 // The connection should download highest priority pieces first, without any

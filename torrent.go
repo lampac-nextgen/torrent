@@ -132,6 +132,9 @@ type Torrent struct {
 	completedPieces bitmap.Bitmap
 	// Pieces that need to be hashed.
 	piecesQueuedForHash bitmap.Bitmap
+	// Dense word buffers reused by every iterPieceOrder call. Callers hold the client lock and
+	// iterPieceOrder does not nest, so one pair per torrent is enough.
+	pieceOrderSkip, pieceOrderScratch []uint64
 
 	// A pool of piece priorities []int for assignment to new connections.
 	// These "inclinations" are used to give connections preference for

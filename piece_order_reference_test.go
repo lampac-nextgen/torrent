@@ -54,11 +54,16 @@ func randomPieceOrderFixture(t testing.TB, rnd *rand.Rand, pieces int) (cn *conn
 	cn = chokeFixture(pieces)
 	t.Cleanup(func() { stopChokeFixture(cn) })
 	cn.peerSentHaveAll = rnd.Intn(4) == 0
+	// A dense fixture puts the completed and queued sets above 4096 bits per chunk.
+	spread := 10
+	if rnd.Intn(2) == 0 {
+		spread = 3
+	}
 	for i := range pieces {
 		if rnd.Intn(4) != 0 {
 			cn.peerPieces.Add(i)
 		}
-		switch rnd.Intn(10) {
+		switch rnd.Intn(spread) {
 		case 0:
 			cn.t.completedPieces.Add(i)
 		case 1:
@@ -78,7 +83,28 @@ func randomPieceOrderFixture(t testing.TB, rnd *rand.Rand, pieces int) (cn *conn
 		}
 		classes[c].AddRange(begin, end)
 	}
+	// Above 4096 set bits roaring holds a chunk as a bitmap container and after RunOptimize as
+	// runs; the dense skip buffer is filled differently for each kind.
+	if rnd.Intn(2) == 0 {
+		cn.peerPieces.AddRange(0, rnd.Intn(pieces)+1)
+		begin := rnd.Intn(pieces)
+		cn.t.completedPieces.AddRange(begin, begin+rnd.Intn(pieces-begin)+1)
+		begin = rnd.Intn(pieces)
+		cn.t.piecesQueuedForHash.AddRange(begin, begin+rnd.Intn(pieces-begin)+1)
+		for _, bm := range []*bitmap.Bitmap{&cn.peerPieces, &cn.t.completedPieces, &cn.t.piecesQueuedForHash} {
+			if bm.RB != nil {
+				bm.RB.RunOptimize()
+			}
+		}
+	}
 	return cn, classes
+}
+
+func randomPieceCount(rnd *rand.Rand, run int) int {
+	if run%5 == 0 {
+		return 5000 + rnd.Intn(20000)
+	}
+	return 1 + rnd.Intn(300)
 }
 
 func collectOrder(iterate func(func(pieceIndex) bool) bool, limit int) (got []pieceIndex, all bool) {
@@ -93,9 +119,30 @@ func collectOrder(iterate func(func(pieceIndex) bool) bool, limit int) (got []pi
 // and stops at the same place, as the bitmap-building version it replaced.
 func TestIterPieceOrderMatchesOracle(t *testing.T) {
 	rnd := rand.New(rand.NewSource(1))
+	// Container kinds seen per set: peer, completed, queued. WriteDenseTo fills each kind
+	// differently, and a bitmap container overwrites instead of OR-ing.
+	var bitmapContainers, runContainers [3]uint64
+	defer func() {
+		for i := range 3 {
+			if !t.Failed() && (bitmapContainers[i] == 0 || runContainers[i] == 0) {
+				t.Errorf("set %d: fixtures built %d bitmap and %d run containers, want both", i, bitmapContainers[i], runContainers[i])
+			}
+		}
+	}()
 	for run := range 500 {
-		cn, c := randomPieceOrderFixture(t, rnd, 1+rnd.Intn(300))
+		pieces := randomPieceCount(rnd, run)
+		cn, c := randomPieceOrderFixture(t, rnd, pieces)
+		for i, bm := range []*bitmap.Bitmap{&cn.peerPieces, &cn.t.completedPieces, &cn.t.piecesQueuedForHash} {
+			if bm.RB != nil {
+				st := bm.RB.Stats()
+				bitmapContainers[i] += st.BitmapContainers
+				runContainers[i] += st.RunContainers
+			}
+		}
 		limit := 1 + rnd.Intn(400)
+		if run%3 == 0 {
+			limit = pieces + 1
+		}
 		want, wantAll := collectOrder(func(f func(pieceIndex) bool) bool {
 			return cn.iterPieceOrderBeforeSkipTests(f, c[0], c[1], c[2], c[3])
 		}, limit)
