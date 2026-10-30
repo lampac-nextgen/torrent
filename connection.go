@@ -720,9 +720,9 @@ func (cn *connection) updateRequests() {
 	cn.tickleWriter()
 }
 
-func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) bool) bool {
+func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) bool, bufs *pieceOrderBufs) bool {
 	now, next, readahead, zone := cn.t.readerPiecePriorities()
-	return cn.iterPieceOrder(f, now, next, readahead, zone)
+	return cn.iterPieceOrder(f, bufs, now, next, readahead, zone)
 }
 
 // iterPieceOrder emits the reader priority classes in order, then the other pending pieces, each
@@ -731,8 +731,12 @@ func (cn *connection) iterUnbiasedPieceRequestOrder(f func(piece pieceIndex) boo
 // per class allocated several roaring containers per pass, about half of all allocations while
 // streaming a large torrent; per-piece Contains on sparse sets avoided that but made a full scan
 // slower. The set now lives in a reused dense buffer: no allocation, and an O(1) test per piece.
-func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, classes ...bitmap.Bitmap) bool {
-	skip := cn.buildPieceOrderSkip()
+//
+// bufs is the storage for that set. The writer path passes the torrent's own buffers: it runs under
+// the exclusive client lock. WriteStatus holds only the read lock, so two of them can overlap and
+// must pass their own.
+func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, bufs *pieceOrderBufs, classes ...bitmap.Bitmap) bool {
+	skip := cn.buildPieceOrderSkip(bufs)
 	yield := func(i int) bool {
 		w, b := i>>6, uint64(1)<<(uint(i)&63)
 		if w >= len(skip) || skip[w]&b != 0 {
@@ -752,9 +756,14 @@ func (cn *connection) iterPieceOrder(f func(pieceIndex) bool, classes ...bitmap.
 	return cn.t.pendingPieces.IterTyped(yield)
 }
 
-// buildPieceOrderSkip fills t.pieceOrderSkip with the pieces this peer lacks, the pieces we have
-// and the pieces queued for a hash.
-func (cn *connection) buildPieceOrderSkip() []uint64 {
+// pieceOrderBufs holds the dense word buffers behind a piece order skip set.
+type pieceOrderBufs struct {
+	skip, scratch []uint64
+}
+
+// buildPieceOrderSkip fills bufs.skip with the pieces this peer lacks, the pieces we have and the
+// pieces queued for a hash.
+func (cn *connection) buildPieceOrderSkip(bufs *pieceOrderBufs) []uint64 {
 	t := cn.t
 	n := (t.numPieces() + 63) / 64
 	for _, bm := range [...]*bitmap.Bitmap{&cn.peerPieces, &t.completedPieces, &t.piecesQueuedForHash} {
@@ -764,7 +773,7 @@ func (cn *connection) buildPieceOrderSkip() []uint64 {
 			}
 		}
 	}
-	skip := growWords(&t.pieceOrderSkip, n)
+	skip := growWords(&bufs.skip, n)
 	if !cn.peerSentHaveAll {
 		if cn.peerPieces.RB != nil {
 			cn.peerPieces.RB.WriteDenseTo(skip)
@@ -779,7 +788,7 @@ func (cn *connection) buildPieceOrderSkip() []uint64 {
 		if bm.RB == nil || bm.RB.IsEmpty() {
 			continue
 		}
-		scratch := growWords(&t.pieceOrderScratch, n)
+		scratch := growWords(&bufs.scratch, n)
 		bm.RB.WriteDenseTo(scratch)
 		for i, w := range scratch {
 			skip[i] |= w
@@ -821,15 +830,20 @@ func (cn *connection) shouldRequestWithoutBias() bool {
 	return false
 }
 
+// iterPendingPieces runs under the exclusive client lock and uses the torrent's shared buffers.
 func (cn *connection) iterPendingPieces(f func(pieceIndex) bool) bool {
+	return cn.iterPendingPiecesBufs(f, &cn.t.pieceOrder)
+}
+
+func (cn *connection) iterPendingPiecesBufs(f func(pieceIndex) bool, bufs *pieceOrderBufs) bool {
 	if !cn.t.haveInfo() {
 		return false
 	}
 	if cn.t.requestStrategy == 3 {
-		return cn.iterUnbiasedPieceRequestOrder(f)
+		return cn.iterUnbiasedPieceRequestOrder(f, bufs)
 	}
 	if cn.shouldRequestWithoutBias() {
-		return cn.iterUnbiasedPieceRequestOrder(f)
+		return cn.iterUnbiasedPieceRequestOrder(f, bufs)
 	} else {
 		return cn.pieceRequestOrder.IterTyped(func(i int) bool {
 			return f(pieceIndex(i))
@@ -837,8 +851,10 @@ func (cn *connection) iterPendingPieces(f func(pieceIndex) bool) bool {
 	}
 }
 
+// iterPendingPiecesUntyped is for WriteStatus, which holds only the client read lock. Concurrent
+// callers must not share the torrent's buffers, so it allocates its own.
 func (cn *connection) iterPendingPiecesUntyped(f iter.Callback) {
-	cn.iterPendingPieces(func(i pieceIndex) bool { return f(i) })
+	cn.iterPendingPiecesBufs(func(i pieceIndex) bool { return f(i) }, new(pieceOrderBufs))
 }
 
 // maxStallProneRequests is how many connections may hold the same chunk of the piece under a
