@@ -3,6 +3,7 @@ package torrent
 import (
 	"math/rand"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -147,7 +148,7 @@ func TestIterPieceOrderMatchesOracle(t *testing.T) {
 			return cn.iterPieceOrderBeforeSkipTests(f, c[0], c[1], c[2], c[3])
 		}, limit)
 		got, gotAll := collectOrder(func(f func(pieceIndex) bool) bool {
-			return cn.iterPieceOrder(f, c[0], c[1], c[2], c[3])
+			return cn.iterPieceOrder(f, &cn.t.pieceOrder, c[0], c[1], c[2], c[3])
 		}, limit)
 		if !slices.Equal(got, want) || gotAll != wantAll {
 			t.Fatalf("run %d: order %v (all %v), oracle %v (all %v)", run, got, gotAll, want, wantAll)
@@ -161,7 +162,7 @@ func BenchmarkIterPieceOrder(b *testing.B) {
 	for name, iterate := range map[string]func(func(pieceIndex) bool) bool{
 		"oracle": func(f func(pieceIndex) bool) bool { return cn.iterPieceOrderBeforeSkipTests(f, c[0], c[1], c[2], c[3]) },
 		"skip-per-piece": func(f func(pieceIndex) bool) bool {
-			return cn.iterPieceOrder(f, c[0], c[1], c[2], c[3])
+			return cn.iterPieceOrder(f, &cn.t.pieceOrder, c[0], c[1], c[2], c[3])
 		},
 	} {
 		b.Run(name, func(b *testing.B) {
@@ -172,4 +173,25 @@ func BenchmarkIterPieceOrder(b *testing.B) {
 			}
 		})
 	}
+}
+
+// Client.WriteStatus holds only the client read lock, so several can run iterPendingPieces at once.
+// They must not share the torrent's skip buffers. Fails under -race if they do.
+func TestIterPendingPiecesUntypedConcurrent(t *testing.T) {
+	cn, _ := randomPieceOrderFixture(t, rand.New(rand.NewSource(1)), 4000)
+	cn.t.requestStrategy = 3
+	if !cn.t.haveInfo() {
+		t.Fatal("fixture has no info, iterPendingPieces would return early")
+	}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				iter.ToSlice(iter.Head(10, cn.iterPendingPiecesUntyped))
+			}
+		}()
+	}
+	wg.Wait()
 }
