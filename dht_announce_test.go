@@ -76,3 +76,38 @@ func TestAnnounceToDhtReturnsWhenTraversalEnds(t *testing.T) {
 	assert.Less(t, time.Since(start), 3*time.Second,
 		"announceToDht must return when the traversal ends, not wait the full regular interval")
 }
+
+// AnnounceToDht reads the listen port through incomingPeerPort, which walks cl.conns.
+// Client.Close sets cl.conns to nil under the client lock, so the read must hold it too.
+// Fails under -race when dhtAnnouncer's announce races a Close (seen as a flake at
+// TorrServer's Disconnect: closeSockets write against LocalPort read).
+func TestAnnounceToDhtPortReadIsLockedAgainstClose(t *testing.T) {
+	cfg := NewDefaultClientConfig()
+	cfg.ListenPort = 0
+	cfg.NoDHT = true
+	cfg.NoDefaultPortForwarding = true
+	cl, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	tr, _ := cl.AddTorrentInfoHash(metainfo.Hash{})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = tr.announceToDht(stubDhtServer{})
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond) // let announces run
+	cl.Close()
+	close(stop)
+	<-done
+}

@@ -1449,7 +1449,13 @@ func (t *Torrent) consumeDhtAnnouncePeers(pvs <-chan dht.PeersValues) {
 // Announce using the provided DHT server. Peers are consumed automatically. done is closed when the
 // announce ends. stop will force the announce to end.
 func (t *Torrent) AnnounceToDht(s DhtServer) (done <-chan struct{}, stop func(), err error) {
-	ps, err := s.Announce(t.infoHash, t.cl.incomingPeerPort(), true)
+	// incomingPeerPort walks cl.conns, which Client.Close sets to nil under the client
+	// lock. dhtAnnouncer calls this without the lock, so take the read lock for the port.
+	// Announce itself must run outside it: it does network I/O.
+	t.cl.rLock()
+	port := t.cl.incomingPeerPort()
+	t.cl.rUnlock()
+	ps, err := s.Announce(t.infoHash, port, true)
 	if err != nil {
 		return
 	}
