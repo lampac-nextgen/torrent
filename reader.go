@@ -43,6 +43,10 @@ type reader struct {
 	// Adjust the read/seek window to handle Readers locked to File extents and the like.
 	offset, length int64
 
+	// Set by Close, under the Client lock. A closed reader no longer waits for data that is not
+	// there yet: a Read blocked on it returns io.ErrClosedPipe.
+	closed bool
+
 	// Required when modifying pos, readahead, next and zone, or reading them without opMu.
 	mu        sync.Locker
 	pos       int64
@@ -184,11 +188,17 @@ func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
 	// synchronized.
 	var ctxErr error
 	if ctx.Done() != nil {
-		ctx, cancel := context.WithCancel(ctx)
+		parent := ctx
+		ctx, cancel := context.WithCancel(parent)
 		// Abort the goroutine when the function returns.
 		defer cancel()
 		go func() {
 			<-ctx.Done()
+			if parent.Err() == nil {
+				// Our own cancel on return: nobody is waiting, so skip the exclusive Client
+				// lock. Taking it once per Read made every Read contend with the whole client.
+				return
+			}
 			r.t.cl.lock()
 			ctxErr = ctx.Err()
 			r.t.tickleReaders()
@@ -230,6 +240,12 @@ func (r *reader) waitAvailable(pos, wanted int64, ctxErr *error, wait bool) (ava
 		}
 		if r.t.closed.IsSet() {
 			err = errors.New("torrent closed")
+			return
+		}
+		if r.closed {
+			// Data that is already readable was returned above. Waiting for more would block
+			// for good: Close removed this reader, so nothing wants these pieces any more.
+			err = io.ErrClosedPipe
 			return
 		}
 		if *ctxErr != nil {
@@ -298,7 +314,13 @@ func (r *reader) readOnceAt(b []byte, pos int64, ctxErr *error) (n int, err erro
 func (r *reader) Close() error {
 	r.t.cl.lock()
 	defer r.t.cl.unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
 	r.t.deleteReader(r)
+	// Wake a Read that is waiting for data on this reader.
+	r.t.tickleReaders()
 	return nil
 }
 
